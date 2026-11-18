@@ -1,12 +1,18 @@
-"""The editor's working copy of a project (a set of NI PCIe-6509 boards), the
-rules that decide whether it is safe to save, file I/O, and undo history.
+"""The editor's working copy of the open boards, the rules that decide whether
+they are safe to save, file reading, and undo history.
 
 No Qt in here: everything is plain Python. The GUI only edits a ``Project``
-and asks it for ``issues()`` and ``to_json()``.
+(the boards that are open) and asks it for ``issues()``.
 
-Each board holds *signals*: a name, the DIO line it maps to and an optional
-note. Direction is fixed by the line, the way these 6509s are used: ports
-P0-P5 (pins 1-48) are outputs and ports P6-P11 (pins 51-98) are inputs.
+Every board is one config file: ``{"name": ..., "type": ..., "signals": [...]}``.
+A board has a type (NI 6509, NI 9205, ... see ``pinout.py``) and holds
+*signals*: a name, the channel it maps to and an optional note. Direction
+comes from the board type. On most boards it is fixed by the channel (6509:
+P0-P5 outputs, P6-P11 inputs; 9205 inputs; 9264 and 9476 outputs). On the
+NI 9401 the user sets it, and DIO0-3 and DIO4-7 each share one direction.
+
+Which file a board came from and whether it has unsaved changes is the
+window's business (``app.py``), not the model's.
 """
 
 from __future__ import annotations
@@ -14,28 +20,16 @@ from __future__ import annotations
 import bisect
 import copy
 import difflib
+import itertools
 import json
 import re
 from dataclasses import dataclass, field
-from enum import Enum, IntEnum
+from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from pinout import Line, SignalKind, signal_at
-
-
-class Direction(str, Enum):
-    INPUT = "input"
-    OUTPUT = "output"
-
-
-#: Ports wired as outputs on every 6509 board (pins 1-48); ports 6-11 are inputs.
-OUTPUT_PORTS = range(0, 6)
-
-
-def direction_of(line: Line) -> Direction:
-    """P0-P5 (pins 1-50 block) are outputs, P6-P11 (pins 51-100 block) inputs."""
-    return Direction.OUTPUT if line.port in OUTPUT_PORTS else Direction.INPUT
+from pinout import (BOARD_TYPES, DEFAULT_TYPE, BoardType, Direction, Line, SignalKind,
+                    board_type, find_type)
 
 
 class Severity(IntEnum):
@@ -45,30 +39,92 @@ class Severity(IntEnum):
 
 @dataclass
 class Assignment:
-    """One signal: its name and note. The line it maps to is the key it is
-    stored under in ``Board.lines``; its direction follows from that line
-    (``direction_of``)."""
+    """One signal: its name and note. The channel it maps to is the key it
+    is stored under in ``Board.lines``. ``direction`` is only kept for
+    channels whose direction the user sets (NI 9401); everywhere else it
+    follows from the channel. Ask ``Board.direction(line)`` either way."""
 
     name: str
     note: str = ""
+    direction: Direction | None = None
+
+
+_uids = itertools.count(1)
 
 
 @dataclass
 class Board:
     name: str
     lines: dict[Line, Assignment] = field(default_factory=dict)
+    type: str = DEFAULT_TYPE  # a key of ``pinout.BOARD_TYPES``, e.g. "NI 9205"
+    #: Stays the same through renames, undo and reload, so the window can
+    #: remember which file this board belongs to.
+    uid: int = field(default_factory=lambda: next(_uids), compare=False)
 
     @classmethod
-    def numbered(cls, index: int) -> Board:
+    def numbered(cls, index: int, type: str = DEFAULT_TYPE) -> Board:
         """A blank board for position ``index`` (0-based): "Board 1"."""
-        return cls(name=f"Board {index + 1}")
+        return cls(name=f"Board {index + 1}", type=type)
+
+    @property
+    def bt(self) -> BoardType:
+        """The pin map and rules for this board's type."""
+        return board_type(self.type)
 
     @property
     def label(self) -> str:
         return self.name.strip() or "(unnamed board)"
 
+    def direction(self, line: Line) -> Direction:
+        """Direction of a channel: fixed by the board type, or, where the
+        user sets it, what its group is set to (input until set)."""
+        fixed = self.bt.fixed_direction(line)
+        if fixed is not None:
+            return fixed
+        a = self.lines.get(line)
+        if a is not None and a.direction is not None:
+            return a.direction
+        return self.group_direction(line) or Direction.INPUT
+
+    def group_direction(self, line: Line, skip: Line | None = None) -> Direction | None:
+        """The direction already set by another signal in ``line``'s group."""
+        group = self.bt.group(line)
+        if group is None:
+            return None
+        return next((a.direction for other, a in self.lines.items()
+                     if other != skip and a.direction is not None
+                     and self.bt.group(other) == group), None)
+
+    def set_direction(self, line: Line, direction: Direction) -> None:
+        """Set the direction of ``line`` and of every signal sharing it."""
+        group = self.bt.group(line)
+        if group is None:
+            return
+        for other, a in self.lines.items():
+            if self.bt.group(other) == group:
+                a.direction = direction
+
     def sorted_lines(self) -> list[tuple[Line, Assignment]]:
         return sorted(self.lines.items())
+
+    def to_document(self) -> dict[str, Any]:
+        """What this board's file holds: ``line`` (never ``pin``), sorted by
+        line, so the same board always produces the same file."""
+        signals = []
+        for line, a in self.sorted_lines():
+            sig: dict[str, Any] = {
+                "name": a.name.strip(),
+                "line": str(line),
+                "direction": self.direction(line).value,
+            }
+            if a.note.strip():
+                sig["note"] = a.note.strip()
+            signals.append(sig)
+        return {"name": self.name.strip(), "type": self.type, "signals": signals}
+
+    def to_json(self) -> str:
+        """The exact text of this board's file."""
+        return json.dumps(self.to_document(), indent=2) + "\n"
 
 
 @dataclass
@@ -95,6 +151,12 @@ class FileProblem:
     board: int | None = None  # board it belongs to, if any
     line: Line | None = None  # where the signal was placed, if it was kept
     fatal: bool = False  # nothing could be loaded (e.g. the JSON itself is broken)
+    file: str = ""  # name of the file it was found in
+
+
+#: Board files are a few kilobytes. Anything this big is the wrong file, and
+#: reading it would only freeze the window.
+MAX_FILE_BYTES = 5_000_000
 
 
 class LoadError(ValueError):
@@ -111,9 +173,13 @@ LEGACY_SIGNAL_KEYS = {"selected"}
 #: The retired top-level project title. Recorded under this label (not "name",
 #: which boards and signals still use) so the notice is unambiguous.
 PROJECT_NAME = "project name"
+#: Recorded when a board in the file has no "type" (files from before the
+#: other board types existed): saving writes it.
+NO_TYPE = "board type"
+#: Recorded for the older shape with several boards in one file.
+MANY = "boards list"
 _TOP_KEYS = {"name", "boards"}
-_SINGLE_KEYS = {"name", "card", "buttons", "signals"}
-_BOARD_KEYS = {"name", "signals", "buttons"} | LEGACY_BOARD_KEYS
+_BOARD_KEYS = {"name", "type", "signals", "buttons"} | LEGACY_BOARD_KEYS
 _SIGNAL_KEYS = {"name", "line", "pin", "direction", "note"} | LEGACY_SIGNAL_KEYS
 
 
@@ -132,7 +198,12 @@ class Project:
             out.append('"buttons" becomes "signals"')
         if PROJECT_NAME in self.dropped_fields:
             out.append('the project "name" at the top of the file is removed')
-        out += [f'"{k}" is removed' for k in sorted(self.dropped_fields - {"buttons", PROJECT_NAME})]
+        if NO_TYPE in self.dropped_fields:
+            out.append('each board gets its "type" (NI 6509)')
+        if MANY in self.dropped_fields:
+            out.append("each board is saved to its own file")
+        out += [f'"{k}" is removed'
+                for k in sorted(self.dropped_fields - {"buttons", PROJECT_NAME, NO_TYPE, MANY})]
         return out
 
     # ------------------------------------------------------------ copies
@@ -148,10 +219,13 @@ class Project:
 
     @classmethod
     def from_json(cls, text: str) -> Project:
-        """Read a mapping file. Never raises for problems in the content:
+        """Read a board file. Never raises for problems in the content:
         they are collected in ``file_problems`` and the rest is loaded."""
         try:
             json.loads(text)
+        except RecursionError:  # brackets nested thousands deep: not a board file
+            return cls(file_problems=[FileProblem(
+                "nested far too deeply to be a board file — nothing could be loaded", fatal=True)])
         except json.JSONDecodeError as e:
             lines = text.splitlines()
             shown = lines[e.lineno - 1].strip() if 0 < e.lineno <= len(lines) else ""
@@ -160,14 +234,22 @@ class Project:
                 f"not valid JSON ({e.msg}, column {e.colno}){snippet} — nothing could be loaded",
                 at=e.lineno, fatal=True)])
         problems: list[FileProblem] = []
-        data = _parse_located(text, problems)
+        try:
+            data = _parse_located(text, problems)
+        except RecursionError:
+            return cls(file_problems=[FileProblem(
+                "nested far too deeply to be a board file — nothing could be loaded", fatal=True)])
         return cls.from_document(data, problems)
 
     @classmethod
     def load(cls, path: str | Path) -> Project:
         path = Path(path)
         try:
-            text = path.read_text(encoding="utf-8")
+            if path.stat().st_size > MAX_FILE_BYTES:
+                raise LoadError(f"{path.name} is too large to be a board file "
+                                f"(over {MAX_FILE_BYTES // 1_000_000} MB)")
+            # utf-8-sig: also reads files saved with a byte-order mark (Windows Notepad).
+            text = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             raise LoadError(f"{path.name} is not a UTF-8 text file") from None
         except OSError as e:
@@ -176,17 +258,20 @@ class Project:
 
     @classmethod
     def from_document(cls, data: Any, problems: list[FileProblem] | None = None) -> Project:
-        """Accepts the ``boards`` shape and the older single-board shape."""
+        """One board per file: ``{"name", "type", "signals"}``. The older
+        shape with several boards under ``"boards"`` is still read."""
         problems = [] if problems is None else problems
         if not isinstance(data, dict):
             problems.append(FileProblem(
-                'the file must be a JSON object { "boards": [...] } — nothing could be loaded',
+                'the file must be a JSON object { "name": ..., "signals": [...] } — '
+                "nothing could be loaded",
                 at=_at(data), fatal=True))
             return cls(file_problems=problems)
         dropped: set[str] = set()
-        if "name" in data:
-            dropped.add(PROJECT_NAME)
         if "boards" in data:
+            dropped.add(MANY)
+            if "name" in data:
+                dropped.add(PROJECT_NAME)
             _unknown(data, _TOP_KEYS, {"boards"}, "top of the file", problems, None)
             boards = data["boards"]
             if isinstance(boards, list) and boards:
@@ -197,71 +282,69 @@ class Project:
                     at=_at(data, "boards")))
                 parsed = [Board.numbered(0)]
         elif "signals" in data or "buttons" in data:
-            # Older single-board shape: the signals sit at the top level.
-            _unknown(data, _SINGLE_KEYS, {"boards", "signals"}, "top of the file", problems, None)
-            if "card" in data:
-                dropped.add("card")
-            single = _Obj(data.line if isinstance(data, _Obj) else None)
-            for k in ("signals", "buttons"):
-                if k in data:
-                    single[k] = data[k]
-                    single.key_lines[k] = _at(data, k)
-            parsed = [_board_from(single, 0, dropped, problems)]
+            # One board: its name, type and signals sit at the top level.
+            parsed = [_board_from(data, 0, dropped, problems)]
         else:
             problems.append(FileProblem(
-                'no "boards" list in the file — nothing could be loaded', at=_at(data), fatal=True))
+                'no "signals" list in the file — nothing could be loaded', at=_at(data), fatal=True))
             parsed = [Board.numbered(0)]
         return cls(boards=parsed, dropped_fields=dropped, file_problems=problems)
 
     # ------------------------------------------------------------ saving
 
-    def to_document(self) -> dict[str, Any]:
-        """Always the ``boards`` shape, ``line`` (never ``pin``), sorted by
-        line: the same input always produces the same file."""
-        doc: dict[str, Any] = {"boards": []}
-        for b in self.boards:
-            signals = []
-            for line, a in b.sorted_lines():
-                sig: dict[str, Any] = {
-                    "name": a.name.strip(),
-                    "line": str(line),
-                    "direction": direction_of(line).value,
-                }
-                if a.note.strip():
-                    sig["note"] = a.note.strip()
-                signals.append(sig)
-            doc["boards"].append({"name": b.name.strip(), "signals": signals})
-        return doc
-
     def to_json(self) -> str:
-        return json.dumps(self.to_document(), indent=2) + "\n"
-
-    def save(self, path: str | Path) -> None:
-        Path(path).write_text(self.to_json(), encoding="utf-8")
-        self.dropped_fields = set()
+        """Every open board, in order. Not a file format: it is what undo
+        history and ``==`` compare."""
+        return json.dumps([b.to_document() for b in self.boards], indent=2) + "\n"
 
     # ------------------------------------------------------------ editing
 
     def signal_count(self) -> int:
         return sum(len(b.lines) for b in self.boards)
 
-    def _next_free_board(self) -> Board:
+    def _next_free_board(self, type: str) -> Board:
         taken = {b.name.strip().lower() for b in self.boards}
         n = len(self.boards)
         while f"board {n + 1}" in taken:
             n += 1
-        return Board.numbered(n)
+        return Board.numbered(n, type)
 
-    def add_board(self) -> int:
-        """Add the next free "Board N". Returns its index."""
-        self.boards.append(self._next_free_board())
+    def add_board(self, type: str = DEFAULT_TYPE) -> int:
+        """Add the next free "Board N" of the given type. Returns its index."""
+        self.boards.append(self._next_free_board(type))
         return len(self.boards) - 1
 
+    def add_boards(self, boards: list[Board], problems: list[FileProblem] = (), file: str = "") -> int:
+        """Add boards read from ``file``, with the problems found in it.
+        Returns the index of the first one."""
+        base = len(self.boards)
+        self.boards += boards
+        for fp in problems:
+            fp.board, fp.file = base + (fp.board or 0), file
+            self.file_problems.append(fp)
+        return base
+
+    def replace_board(self, index: int, board: Board, problems: list[FileProblem] = (),
+                      file: str = "") -> None:
+        """Swap in a board read again from its file. It stays the same board
+        (same ``uid``) as far as the window is concerned."""
+        board.uid = self.boards[index].uid
+        self.boards[index] = board
+        self.file_problems = [fp for fp in self.file_problems if fp.board != index]
+        for fp in problems:
+            fp.board, fp.file = index, file
+            self.file_problems.append(fp)
+
     def remove_board(self, index: int) -> bool:
-        """The last board can't be removed."""
+        """Take a board out, with the problems found in its file. The last
+        board can't be removed."""
         if len(self.boards) <= 1 or not 0 <= index < len(self.boards):
             return False
         del self.boards[index]
+        self.file_problems = [fp for fp in self.file_problems if fp.board != index]
+        for fp in self.file_problems:
+            if fp.board is not None and fp.board > index:
+                fp.board -= 1
         return True
 
     def name_taken(self, name: str) -> bool:
@@ -282,29 +365,39 @@ class Project:
 
     def assign(self, board: int, line: Line) -> Assignment:
         """Add a signal with a project-wide unique default name like
-        ``B2_P0_7``. Its direction follows from the line."""
+        ``B2_P0_7``. Its direction follows from the line; where the user
+        sets it, it starts as whatever its group already is."""
         b = self.boards[board]
         if line not in b.lines:
-            b.lines[line] = Assignment(self._unique_name(f"B{board + 1}_P{line.port}_{line.line}"))
+            direction = None
+            if b.bt.fixed_direction(line) is None:
+                direction = b.group_direction(line) or Direction.INPUT
+            b.lines[line] = Assignment(self._unique_name(b.bt.default_name(board, line)),
+                                       direction=direction)
         return b.lines[line]
 
     def move(self, board: int, src: Line, dst: Line) -> bool:
         """Move an assignment to a free line on the same board."""
-        lines = self.boards[board].lines
+        b = self.boards[board]
+        lines = b.lines
         if src == dst or dst in lines or src not in lines:
             return False
-        lines[dst] = lines.pop(src)
+        a = lines.pop(src)
+        if b.bt.fixed_direction(dst) is None:
+            # Joining another group: take that group's direction.
+            a.direction = b.group_direction(dst) or a.direction or Direction.INPUT
+        lines[dst] = a
         return True
 
     # ------------------------------------------------------------ rules
 
     def issues(self) -> list[Issue]:
         out: list[Issue] = []
-        for fp in sorted(self.file_problems, key=lambda f: f.at if f.at is not None else 1 << 30):
+        for fp in sorted(self.file_problems, key=lambda f: (f.board or 0, f.at if f.at is not None else 1 << 30)):
             board = fp.board if fp.board is not None and fp.board < len(self.boards) else None
-            where = f"line {fp.at}: " if fp.at else ""
+            where = (fp.file or "file") + (f" line {fp.at}" if fp.at else "")
             out.append(Issue(Severity.ERROR, board, fp.line if board is not None else None,
-                             f"file {where}{fp.message}", from_file=True))
+                             f"{where}: {fp.message}", from_file=True))
         board_names: dict[str, list[int]] = {}
         # Every named signal in the project: upper-case name -> [(board, line)]
         names: dict[str, list[tuple[int, Line]]] = {}
@@ -350,7 +443,7 @@ class Project:
         # File problems first (in file order), then errors, then by board and position.
         out.sort(key=lambda i: (not i.from_file, -i.severity,
                                 0 if i.from_file else (i.board if i.board is not None else -1),
-                                (0, 0) if i.from_file or not i.line else (i.line.port, i.line.line)))
+                                0 if i.from_file or not i.line else i.line.index))
         return out
 
     def errors(self) -> list[Issue]:
@@ -358,7 +451,7 @@ class Project:
 
 
 def worst_on(issues: list[Issue], board: int, line: Line | None = None) -> Severity | None:
-    """Worst issue on one 6509 line (``line`` given) or anywhere on a board."""
+    """Worst issue on one channel (``line`` given) or anywhere on a board."""
     found = [i.severity for i in issues
              if i.board == board and (line is None or i.line == line)]
     return max(found) if found else None
@@ -534,7 +627,19 @@ def _board_from(bf: Any, index: int, dropped: set[str], problems: list[FileProbl
             at=_at(bf, "name"), board=index))
         name = default.name
     label = name.strip() or f"board {index + 1}"
-    _unknown(bf, _BOARD_KEYS, {"name", "signals"}, label, problems, index)
+    _unknown(bf, _BOARD_KEYS, {"name", "type", "signals"}, label, problems, index)
+    bt = board_type(DEFAULT_TYPE)  # files from before "type" existed are all 6509s
+    if "type" in bf:
+        found = find_type(bf["type"]) if isinstance(bf["type"], str) else None
+        if found is None:
+            problems.append(FileProblem(
+                f'{label}: unknown board "type" {_show(bf["type"])} (known: '
+                f'{", ".join(BOARD_TYPES)}) — read as an {bt.key}',
+                at=_at(bf, "type"), board=index))
+        else:
+            bt = found
+    else:
+        dropped.add(NO_TYPE)
     dropped |= LEGACY_BOARD_KEYS & bf.keys()
     key = "signals"
     if "signals" in bf and "buttons" in bf:
@@ -554,11 +659,11 @@ def _board_from(bf: Any, index: int, dropped: set[str], problems: list[FileProbl
     lines: dict[Line, Assignment] = {}
     for k, sf in enumerate(signals):
         at = signals.item_lines[k] if isinstance(signals, _Arr) else None
-        _signal_from(sf, k, label, index, at, lines, dropped, problems)
-    return Board(name=name, lines=lines)
+        _signal_from(sf, k, label, index, at, bt, lines, dropped, problems)
+    return Board(name=name, lines=lines, type=bt.key)
 
 
-def _signal_from(sf: Any, k: int, label: str, board: int, at: int | None,
+def _signal_from(sf: Any, k: int, label: str, board: int, at: int | None, bt: BoardType,
                  lines: dict[Line, Assignment], dropped: set[str], problems: list[FileProblem]) -> None:
     def problem(msg: str, key: str | None = None, line: Line | None = None) -> None:
         where = _at(sf, key) if key is not None and isinstance(sf, _Obj) and key in sf else at
@@ -576,39 +681,53 @@ def _signal_from(sf: Any, k: int, label: str, board: int, at: int | None,
         problem(f'{who}: "name" is {"missing" if name is None else f"not text ({_show(name)})"} — left out',
                 "name")
         return
-    line, err, err_key = _resolve(sf)
+    line, err, err_key = _resolve(sf, bt)
     if line is None:
         problem(f"{who}: {err} — left out", err_key)
         return
+    pin = bt.pin_of(line)
     if line in lines:
-        problem(f'{who}: {line} (pin {line.pin}) already has "{lines[line].name}" — left out',
+        problem(f'{who}: {line} (pin {pin}) already has "{lines[line].name}" — left out',
                 "line" if "line" in sf else "pin")
         return
     note = sf.get("note") or ""
     if not isinstance(note, str):
         problem(f'{who}: "note" must be text, not {_show(note)} — note dropped', "note", line)
         note = ""
-    # "direction" is written for readers of the file. It must match the line:
-    # P0-P5 (pins 1-50) are outputs, P6-P11 (pins 51-100) are inputs.
-    expected = direction_of(line)
-    if "direction" in sf:
-        d = sf["direction"]
-        if d not in ("input", "output"):
+    d = sf.get("direction")
+    valid = d in ("input", "output")
+    expected = bt.fixed_direction(line)
+    if expected is not None:
+        # Fixed by the board. "direction" is written for readers of the file
+        # and must match (6509: P0-P5 outputs, P6-P11 inputs).
+        if "direction" in sf and not valid:
             problem(f'{who}: "direction" is {_show(d)}; it must be "input" or "output" — kept on '
                     f"{line} as an {expected.value} (fixed by the pin)", "direction", line)
-        elif d != expected.value:
-            half = ("pins 1-50 (P0-P5) are outputs" if expected is Direction.OUTPUT
-                    else "pins 51-100 (P6-P11) are inputs")
-            problem(f'{who}: says "{d}", but {line} (pin {line.pin}) is an {expected.value}: {half} — '
-                    f"kept on {line} as an {expected.value}; move it if it belongs on the other half",
+        elif "direction" in sf and d != expected.value:
+            move = "; move it if it belongs on the other half" if bt.mixed else ""
+            problem(f'{who}: says "{d}", but {line} (pin {pin}) is an {expected.value}: '
+                    f"{bt.why_direction(line)} — kept on {line} as an {expected.value}{move}",
                     "direction", line)
-    lines[line] = Assignment(name, note)
+        lines[line] = Assignment(name, note)
+        return
+    # Set by the user (NI 9401), and shared with the rest of its group.
+    group = bt.group(line)
+    shared = next((a.direction for other, a in lines.items() if bt.group(other) == group), None)
+    direction = shared or (Direction(d) if valid else Direction.INPUT)
+    if "direction" in sf and not valid:
+        problem(f'{who}: "direction" is {_show(d)}; it must be "input" or "output" — kept on '
+                f"{line} as an {direction.value}", "direction", line)
+    elif valid and d != direction.value:
+        problem(f'{who}: says "{d}", but {group} share one direction and an earlier signal '
+                f"made them {direction.value}s — kept on {line} as an {direction.value}",
+                "direction", line)
+    elif not valid and shared is None:
+        problem(f'{who}: {line} needs a "direction" ("input" or "output"); the {bt.key} has '
+                "no fixed one — kept as an input", None, line)
+    lines[line] = Assignment(name, note, direction)
 
 
-_LOOSE_LINE = re.compile(r"^\s*[Pp]?\s*(\d+)\s*([.,\-_/: ])\s*(\d+)\s*$")
-
-
-def _resolve(sf: dict) -> tuple[Line | None, str, str | None]:
+def _resolve(sf: dict, bt: BoardType) -> tuple[Line | None, str, str | None]:
     """The line a signal maps to, or (None, why not, which field)."""
     has_line, has_pin = sf.get("line") is not None, sf.get("pin") is not None
     if has_line and has_pin:
@@ -617,29 +736,21 @@ def _resolve(sf: dict) -> tuple[Line | None, str, str | None]:
     if has_line:
         v = sf["line"]
         if not isinstance(v, str):
-            return None, f'"line" must be text like "P3.4", not {_show(v)}', "line"
+            return None, f'"line" must be text like "{bt.example}", not {_show(v)}', "line"
         try:
-            return Line.parse(v), "", None
-        except ValueError as e:
-            m = _LOOSE_LINE.match(v)
-            if m:
-                port, ln = int(m.group(1)), int(m.group(3))
-                if port > 11:
-                    return None, f'"{v}": there is no port {port} (ports are P0-P11)', "line"
-                if ln > 7:
-                    return None, f'"{v}": there is no line {ln} (lines are .0-.7)', "line"
-                return None, f'"{v}" is not a 6509 line; did you mean "P{port}.{ln}"?', "line"
+            return bt.parse(v), "", None
+        except ValueError as e:  # the board type says what's wrong and what was probably meant
             return None, str(e), "line"
     if has_pin:
         pin = sf["pin"]
         if isinstance(pin, str) and pin.strip().isdigit():
             return None, f'"pin" is the text "{pin}"; write it as a number: {pin.strip()}', "pin"
         if not isinstance(pin, int) or isinstance(pin, bool):
-            return None, f'"pin" must be a number 1-100, not {_show(pin)}', "pin"
-        s = signal_at(pin)
+            return None, f'"pin" must be a number 1-{bt.pin_count}, not {_show(pin)}', "pin"
+        s = bt.signal_at(pin)
         if s is None:
-            return None, f"pin {pin} is out of range (1-100)", "pin"
-        if s.kind is not SignalKind.DIO:
-            return None, f"pin {pin} is {s}, not a DIO line", "pin"
+            return None, f"pin {pin} is out of range (1-{bt.pin_count})", "pin"
+        if s.kind is not SignalKind.LINE:
+            return None, f"pin {pin} is {s}, which can't carry a signal", "pin"
         return s.line, "", None
-    return None, 'needs a "line" (e.g. "P3.4") or a "pin" (1-100)', None
+    return None, f'needs a "line" (e.g. "{bt.example}") or a "pin" (1-{bt.pin_count})', None

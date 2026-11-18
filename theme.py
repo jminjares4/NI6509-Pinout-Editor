@@ -1,101 +1,149 @@
-"""Colors and the Qt stylesheet. One dark theme, tuned for a lab monitor."""
+"""Colors and the Qt stylesheet. One dark theme, tuned for a lab monitor.
+
+The look in three rules: flat surfaces on a near-black background, cards
+(``QFrame#card``) for the things you work in, and one accent color. Blue and
+violet are otherwise reserved for what they mean on the connector: input and
+output.
+"""
 
 from PyQt6.QtGui import QColor
 
-BG = "#1b1c20"
-PANEL = "#22242a"
-RAISED = "#2c2f37"
-LINE = "#3a3d46"
-TEXT = "#e4e6eb"
-DIM = "#8a8f9b"
-ACCENT = "#60a5fa"
-INPUT = "#2f6eba"
-INPUT_TEXT = "#9dc0f2"
-OUTPUT = "#8e54c4"
-OUTPUT_TEXT = "#c9a8f0"
-FREE = "#30323a"
-VCC = "#783428"
-VCC_TEXT = "#ffc8aa"
-GND = "#121214"
-HOUSING = "#2a2c33"
-OK = "#4ade80"
-WARN = "#fbbf24"
-ERROR = "#f87171"
+# Surfaces, darkest to lightest
+BG = "#0f1115"       # the window
+FIELD = "#0b0d11"    # text fields
+PANEL = "#161920"    # cards
+RAISED = "#1f232c"   # buttons, selected tabs, hover card
+HOVER = "#282d39"
+LINE = "#262b36"     # hairlines and borders
+# Text
+TEXT = "#e6e8ee"
+DIM = "#8b93a3"
+MUTED = "#566070"    # disabled
+ACCENT = "#5b9dff"
+# Connector
+INPUT = "#2f6fd6"
+INPUT_TEXT = "#9cc2ff"
+OUTPUT = "#7c5ad9"
+OUTPUT_TEXT = "#c4b0ff"
+FREE = "#232733"
+VCC = "#7a3524"
+VCC_TEXT = "#ffc9ad"
+GND = "#0a0b0e"
+NC = "#14161b"       # no-connection pins
+NC_TEXT = "#566070"
+AUX = "#3a3829"      # pins the board uses itself (AISENSE, PFI0)
+HOUSING = "#1a1d25"
+HOUSING_EDGE = "#2c313d"
+PIN_EDGE = "#3a4150"
+# Status
+OK = "#3ddc97"
+WARN = "#f5b942"
+ERROR = "#ff6b6b"
 
 
 def qc(hex_color: str) -> QColor:
     return QColor(hex_color)
 
 
+def _rgba(hex_color: str, alpha: int) -> str:
+    c = QColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+
+def _chip(role: str, color: str) -> str:
+    return (f'QLabel[role="{role}"] {{ color: {color}; background: {_rgba(color, 26)}; '
+            f"border: 1px solid {_rgba(color, 90)}; border-radius: 10px; padding: 2px 10px; }}\n")
+
+
 STYLESHEET = f"""
 * {{ color: {TEXT}; font-size: 10pt; }}
 QMainWindow, QWidget#central {{ background: {BG}; }}
-QMenuBar {{ background: {PANEL}; border-bottom: 1px solid {LINE}; }}
-QMenuBar::item {{ padding: 4px 10px; background: transparent; }}
-QMenuBar::item:selected {{ background: {RAISED}; border-radius: 4px; }}
-QMenu {{ background: {PANEL}; border: 1px solid {LINE}; padding: 4px; }}
-QMenu::item {{ padding: 5px 24px 5px 14px; border-radius: 4px; }}
-QMenu::item:selected {{ background: {INPUT}; }}
-QMenu::item:disabled {{ color: {DIM}; }}
-QMenu::separator {{ height: 1px; background: {LINE}; margin: 4px 6px; }}
+QFrame#card {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px; }}
 
-QToolBar {{ background: {PANEL}; border: 0; border-bottom: 1px solid {LINE}; padding: 4px 8px; spacing: 6px; }}
-QToolBar QToolButton {{ padding: 5px 12px; border-radius: 6px; background: {RAISED}; }}
-QToolBar QToolButton:hover {{ background: #3a3e48; }}
-QToolBar QToolButton:disabled {{ color: {DIM}; background: {PANEL}; }}
+QMenuBar {{ background: {BG}; border-bottom: 1px solid {LINE}; padding: 2px 6px; }}
+QMenuBar::item {{ padding: 5px 10px; background: transparent; border-radius: 6px; }}
+QMenuBar::item:selected {{ background: {RAISED}; }}
+QMenu {{ background: {PANEL}; border: 1px solid {LINE}; padding: 6px; }}
+QMenu::item {{ padding: 6px 26px 6px 14px; border-radius: 6px; }}
+QMenu::item:selected {{ background: {HOVER}; }}
+QMenu::item:disabled {{ color: {MUTED}; }}
+QMenu::separator {{ height: 1px; background: {LINE}; margin: 6px 8px; }}
+
+QToolBar {{ background: {BG}; border: 0; border-bottom: 1px solid {LINE}; padding: 5px 12px; spacing: 4px; }}
+QToolBar::separator {{ width: 1px; background: {LINE}; margin: 6px 8px; }}
+QToolBar QToolButton {{ padding: 6px 12px; border-radius: 8px; background: transparent; }}
+QToolBar QToolButton:hover {{ background: {RAISED}; }}
+QToolBar QToolButton:pressed {{ background: {HOVER}; }}
+QToolBar QToolButton:disabled {{ color: {MUTED}; }}
+QToolBar QToolButton#primary {{ background: {INPUT}; color: #ffffff; font-weight: 600; padding: 6px 16px; }}
+QToolBar QToolButton#primary:hover {{ background: #3b7be0; }}
 QToolBar QLabel {{ color: {DIM}; }}
 
 QLineEdit, QPlainTextEdit, QComboBox {{
-  background: #111216; border: 1px solid {LINE}; border-radius: 6px; padding: 4px 8px;
+  background: {FIELD}; border: 1px solid {LINE}; border-radius: 8px; padding: 6px 10px;
   selection-background-color: {INPUT};
 }}
+QLineEdit:hover, QPlainTextEdit:hover, QComboBox:hover {{ border-color: {PIN_EDGE}; }}
 QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
-QComboBox::drop-down {{ border: 0; width: 18px; }}
-QComboBox QAbstractItemView {{ background: {PANEL}; border: 1px solid {LINE}; selection-background-color: {INPUT}; }}
+QComboBox::drop-down {{ border: 0; width: 20px; }}
+QComboBox QAbstractItemView {{ background: {PANEL}; border: 1px solid {LINE}; selection-background-color: {HOVER}; }}
 
-QPushButton {{ background: {RAISED}; border: 1px solid transparent; border-radius: 6px; padding: 5px 14px; }}
-QPushButton:hover {{ background: #3a3e48; }}
-QPushButton:pressed {{ background: #454a55; }}
-QPushButton:disabled {{ color: {DIM}; background: {PANEL}; }}
+QPushButton {{ background: {RAISED}; border: 1px solid {LINE}; border-radius: 8px; padding: 6px 14px; }}
+QPushButton:hover {{ background: {HOVER}; }}
+QPushButton:pressed {{ background: {LINE}; }}
+QPushButton:disabled {{ color: {MUTED}; background: transparent; }}
 QPushButton:focus {{ border-color: {ACCENT}; }}
-QPushButton[role="primary"] {{ background: {INPUT}; font-weight: 600; }}
-QPushButton[role="primary"]:hover {{ background: #3a7cc9; }}
-QPushButton[role="danger"] {{ background: transparent; color: {ERROR}; border: 1px solid rgba(248,113,113,110); }}
-QPushButton[role="danger"]:hover {{ background: rgba(248,113,113,30); }}
-QPushButton[role="fix"] {{ background: transparent; color: {WARN}; border: 1px solid rgba(251,191,36,110); }}
+QPushButton[role="primary"] {{ background: {INPUT}; border-color: {INPUT}; color: #ffffff; font-weight: 600; }}
+QPushButton[role="primary"]:hover {{ background: #3b7be0; }}
+QPushButton[role="ghost"] {{ background: transparent; border: 1px dashed {PIN_EDGE}; color: {DIM}; }}
+QPushButton[role="ghost"]:hover {{ color: {TEXT}; border-color: {ACCENT}; }}
+QPushButton[role="danger"] {{ background: transparent; color: {ERROR}; border: 1px solid {_rgba(ERROR, 80)}; }}
+QPushButton[role="danger"]:hover {{ background: {_rgba(ERROR, 28)}; }}
+QPushButton[role="danger"]:disabled {{ color: {MUTED}; border-color: {LINE}; }}
+QPushButton[role="fix"] {{ background: transparent; color: {WARN}; border: 1px solid {_rgba(WARN, 90)}; }}
+QPushButton[role="fix"]:hover {{ background: {_rgba(WARN, 28)}; }}
 
-QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid #6b7080; background: #111216;
+QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {PIN_EDGE}; background: {FIELD};
                         border-radius: 4px; }}
 QCheckBox::indicator:checked {{ background: {INPUT}; border-color: {INPUT}; }}
 QTableWidget::indicator {{ width: 14px; height: 14px; }}
 
-QTabWidget::pane {{ border: 0; border-top: 1px solid {LINE}; }}
-QTabBar::tab {{ background: transparent; padding: 6px 14px; margin-right: 4px; border-radius: 6px; color: {DIM}; }}
-QTabBar::tab:selected {{ background: {INPUT}; color: {TEXT}; }}
-QTabBar::tab:hover:!selected {{ background: {RAISED}; color: {TEXT}; }}
-QTabBar#boardTabs::tab {{ border: 1px solid {LINE}; padding: 6px 14px; font-weight: 600; }}
-QTabBar#boardTabs::tab:selected {{ border-color: {INPUT}; }}
+/* Tab text colors are set in code (app._tint_tabs), so problems can show. */
+QTabWidget::pane {{ border: 0; }}
+QTabBar::tab {{ background: transparent; padding: 6px 14px; margin-right: 4px; border-radius: 8px; }}
+QTabBar::tab:selected {{ background: {RAISED}; }}
+QTabBar::tab:hover:!selected {{ background: {_rgba("#ffffff", 10)}; }}
+QTabBar#panels::tab {{ border-radius: 0; padding: 9px 14px 8px 14px; margin-right: 2px; font-weight: 600;
+                       border-bottom: 2px solid transparent; }}
+QTabBar#panels::tab:selected {{ background: transparent; border-bottom: 2px solid {ACCENT}; }}
+QTabBar#panels::tab:hover:!selected {{ background: transparent; border-bottom: 2px solid {PIN_EDGE}; }}
+QTabBar#boardTabs::tab {{ border: 1px solid {LINE}; padding: 5px 14px; font-weight: 600; }}
+QTabBar#boardTabs::tab:selected {{ background: {_rgba(ACCENT, 34)}; border-color: {ACCENT}; }}
 
-QTableWidget {{ background: {PANEL}; alternate-background-color: #262830; gridline-color: {LINE};
-               border: 1px solid {LINE}; border-radius: 6px; selection-background-color: {INPUT}; }}
-QHeaderView::section {{ background: {PANEL}; color: {DIM}; border: 0; border-bottom: 1px solid {LINE}; padding: 4px 6px; }}
-QListWidget {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 6px; }}
-QListWidget::item {{ padding: 3px 6px; }}
-QListWidget::item:hover {{ background: {RAISED}; }}
+QTableWidget {{ background: transparent; alternate-background-color: {_rgba("#ffffff", 5)};
+               gridline-color: transparent; border: 0; selection-background-color: {_rgba(ACCENT, 46)}; }}
+QTableWidget::item {{ padding: 2px 6px; }}
+QTableWidget QLineEdit {{ padding: 0 4px; border-radius: 0; }}
+QHeaderView {{ background: transparent; }}
+QHeaderView::section {{ background: transparent; color: {DIM}; border: 0; border-bottom: 1px solid {LINE};
+                        padding: 6px; }}
+QListWidget {{ background: transparent; border: 0; outline: 0; }}
+QListWidget::item {{ padding: 4px 8px; border-radius: 6px; }}
+QListWidget::item:hover, QListWidget::item:selected {{ background: {RAISED}; }}
 
-QScrollArea {{ border: 0; background: {BG}; }}
-QScrollBar:vertical, QScrollBar:horizontal {{ background: {BG}; width: 10px; height: 10px; }}
-QScrollBar::handle {{ background: #454954; border-radius: 5px; min-height: 24px; min-width: 24px; }}
+QScrollArea {{ border: 0; background: transparent; }}
+QScrollBar:vertical, QScrollBar:horizontal {{ background: transparent; width: 8px; height: 8px; margin: 0; }}
+QScrollBar::handle {{ background: {PIN_EDGE}; border-radius: 4px; min-height: 28px; min-width: 28px; }}
+QScrollBar::handle:hover {{ background: {MUTED}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
-QSplitter::handle {{ background: {LINE}; }}
-QStatusBar {{ background: {PANEL}; border-top: 1px solid {LINE}; color: {DIM}; }}
-QToolTip {{ background: {PANEL}; color: {TEXT}; border: 1px solid {LINE}; padding: 6px; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QSplitter::handle {{ background: transparent; }}
+QStatusBar {{ background: {BG}; border-top: 1px solid {LINE}; color: {DIM}; }}
+QStatusBar::item {{ border: 0; }}
+QToolTip {{ background: {RAISED}; color: {TEXT}; border: 1px solid {LINE}; padding: 6px; }}
 
 QLabel[role="dim"] {{ color: {DIM}; }}
-QLabel[role="h1"] {{ font-size: 16pt; font-weight: 600; }}
-QLabel[role="h2"] {{ font-size: 14pt; font-weight: 600; }}
+QLabel[role="h1"] {{ font-size: 15pt; font-weight: 600; }}
+QLabel[role="h2"] {{ font-size: 13pt; font-weight: 600; }}
 QLabel[role="mono"] {{ color: {DIM}; }}  /* font set in code: the system fixed-width font */
-QLabel[role="chip-ok"] {{ color: {OK}; border: 1px solid {OK}; border-radius: 9px; padding: 1px 9px; }}
-QLabel[role="chip-warn"] {{ color: {WARN}; border: 1px solid {WARN}; border-radius: 9px; padding: 1px 9px; }}
-QLabel[role="chip-err"] {{ color: {ERROR}; border: 1px solid {ERROR}; border-radius: 9px; padding: 1px 9px; }}
-"""
+{_chip("chip-ok", OK)}{_chip("chip-warn", WARN)}{_chip("chip-err", ERROR)}"""

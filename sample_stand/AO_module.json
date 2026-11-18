@@ -1,0 +1,21 @@
+{
+  "name": "AO module",
+  "type": "NI 9264",
+  "signals": [
+    {
+      "name": "VALVE_CMD",
+      "line": "AO0",
+      "direction": "output"
+    },
+    {
+      "name": "THROTTLE_CMD",
+      "line": "AO1",
+      "direction": "output"
+    },
+    {
+      "name": "SPARE_AO",
+      "line": "AO15",
+      "direction": "output"
+    }
+  ]
+}

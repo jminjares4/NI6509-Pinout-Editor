@@ -1,0 +1,37 @@
+{
+  "name": "DIO card 1",
+  "type": "NI 6509",
+  "signals": [
+    {
+      "name": "POWER_EN",
+      "line": "P0.0",
+      "direction": "output"
+    },
+    {
+      "name": "ARM",
+      "line": "P0.1",
+      "direction": "output"
+    },
+    {
+      "name": "FIRE",
+      "line": "P0.2",
+      "direction": "output"
+    },
+    {
+      "name": "ABORT",
+      "line": "P0.3",
+      "direction": "output"
+    },
+    {
+      "name": "LAMP_TEST",
+      "line": "P11.0",
+      "direction": "input"
+    },
+    {
+      "name": "HEATER_ON",
+      "line": "P11.7",
+      "direction": "input",
+      "note": "K3 aux contact"
+    }
+  ]
+}
