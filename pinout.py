@@ -4,6 +4,9 @@ Each ``BoardType`` knows its connector (which pin carries what), the channels
 you can put a signal on, how those channels are written in the file, and
 which direction each one has.
 
+Boards belong to one of two areas: HWIL (NI 6509, MicroGate serial card,
+Concurrent analog output card) or Ground Software (the cDAQ modules).
+
 Sources (ni.com/docs):
 
 * NI PCIe-6509: 100-pin connector, two blocks of 50. Pins 1-48 carry ports
@@ -16,6 +19,11 @@ Sources (ni.com/docs):
 The C Series modules are mapped for their DSUB connectors only. The
 spring-terminal versions number their terminals differently and are not
 covered here.
+
+The MicroGate SyncLink GT4e and the Concurrent analog output card are set up
+differently from a pin map: a serial port has a name and a setup, an analog
+channel has a name and a range. Their real connector pinouts are NOT in here
+yet (see ``SERIAL_PINS`` and ``AnalogOut``).
 
 To add a board: write its pin table below and add it to ``BOARD_TYPES``.
 """
@@ -99,20 +107,30 @@ class BoardType:
     names in ``aux`` are pins that can't carry a signal.
     """
 
-    #: True when one board has both fixed inputs and fixed outputs.
-    mixed = False
+    #: Which area of the editor the board lives in, and what its button says.
+    domain = "Ground Software"
+    kind = ""
+    #: An extra setting each signal carries, chosen from a list ("range" on
+    #: the analog card, "setup" on a serial port). Empty: no such setting.
+    option_key = ""
+    option_label = ""
+    options: tuple[str, ...] = ()
+    #: False where input/output means nothing (a serial port is both).
+    writes_direction = True
+    pin_word = "pin"
+    #: False for a drawing that shows which pins are used but not what they are called.
+    names_beside_pins = True
 
     def __init__(self, key: str, title: str, connector: str, blocks: tuple[Block, ...],
                  labels: list[str], prefix: str, *, direction: Direction | None,
-                 why: str = "", group_size: int = 0, aux: dict[str, str] | None = None) -> None:
+                 group_size: int = 0, aux: dict[str, str] | None = None) -> None:
         self.key = key              # written as "type" in the file, e.g. "NI 9205"
-        self.short = key.split()[-1]
+        self.kind = self.kind or key
         self.title = title
         self.connector = connector
         self.blocks = blocks
         self.prefix = prefix
         self._direction = direction  # None: set by the user (NI 9401)
-        self._why = why
         self._group_size = group_size
         self.pins: dict[int, Signal] = {}
         chan = re.compile(rf"^{re.escape(prefix)}(\d+)$")
@@ -143,6 +161,14 @@ class BoardType:
     def pin_of(self, line: Line) -> int:
         return self._pin_of[line]
 
+    def pin_text(self, pin: int) -> str:
+        """What is written in a pin's box."""
+        return str(pin)
+
+    def describe(self, line: Line) -> str:
+        """A channel in words, for the editing box: ``Pin 15  ·  P2.0``."""
+        return f"Pin {self.pin_of(line)}  ·  {line}"
+
     @property
     def example(self) -> str:
         return str(self.lines[min(5, len(self.lines) - 1)])
@@ -152,27 +178,13 @@ class BoardType:
         """The channels in words: ``AI0-AI31``."""
         return f"{self.lines[0]}-{self.lines[-1]}"
 
-    @property
-    def line_pattern(self) -> str:
-        """Regular expression for a channel name (used by the JSON Schema)."""
-        return "^(" + "|".join(re.escape(str(line)) for line in self.lines) + ")$"
-
     def parse(self, text: str) -> Line:
         """``AI5``, ``ai5`` or ``AI 5``. Raises ``ValueError`` saying why not."""
         line = self._by_text.get(re.sub(r"\s+", "", str(text)).upper())
-        if line is not None:
-            return line
-        # A near miss ("A5", "5", "AI07", "AI32"): say what was probably meant.
-        m = re.fullmatch(r"\s*([A-Za-z]*)[\s._-]*(\d+)\s*", str(text))
-        if m and self.prefix.startswith(m.group(1).upper()):
-            m = re.search(r"(\d+)\s*$", str(text))
-            guess = self._by_text.get(f"{self.prefix}{int(m.group(1))}")
-            if guess is None:
-                raise ValueError(f'"{text}": there is no {self.prefix}{int(m.group(1))} on an '
-                                 f"{self.key} (channels are {self.expected})")
-            raise ValueError(f'"{text}" is not an {self.key} channel; did you mean "{guess}"?')
-        raise ValueError(f'"{text}" is not an {self.key} channel '
-                         f'(expected {self.expected}, e.g. "{self.example}")')
+        if line is None:
+            raise ValueError(f'"{text}" is not an {self.key} channel (expected {self.expected}, '
+                             f'e.g. "{self.example}")')
+        return line
 
     # ------------------------------------------------------------ direction
 
@@ -180,10 +192,6 @@ class BoardType:
         """The direction the board gives this channel, or ``None`` when the
         user chooses it."""
         return self._direction
-
-    def why_direction(self, line: Line) -> str:
-        """Why a fixed channel has the direction it has, in a few words."""
-        return self._why
 
     def group(self, line: Line) -> str | None:
         """Channels that must share one direction (``DIO0-DIO3``), or
@@ -193,16 +201,8 @@ class BoardType:
         first = line.index // self._group_size * self._group_size
         return f"{self.prefix}{first}-{self.prefix}{first + self._group_size - 1}"
 
-    def default_name(self, board_index: int, line: Line) -> str:
-        """``B2_P0_7``, ``B3_AI5``."""
-        return f"B{board_index + 1}_" + re.sub(r"\W", "_", str(line))
-
 
 # ---------------------------------------------------------------- NI 6509
-
-_LINE_RE = re.compile(r"^\s*[Pp]?(\d+)\.(\d+)\s*$")
-_LOOSE_LINE = re.compile(r"^\s*[Pp]?\s*(\d+)\s*([.,\-_/: ])\s*(\d+)\s*$")
-
 
 class Ni6509(BoardType):
     """NI PCIe-6509: 96 DIO lines as 12 ports of 8, written ``P<port>.<line>``.
@@ -211,13 +211,12 @@ class Ni6509(BoardType):
     P0-P5 (pins 1-48) are outputs, P6-P11 (pins 51-98) are inputs.
     """
 
-    mixed = True
-    PORTS = 12
     LINES_PER_PORT = 8
     OUTPUT_PORTS = range(0, 6)
 
     def __init__(self) -> None:
-        self.key, self.short = "NI 6509", "6509"
+        self.key = "NI 6509"
+        self.kind, self.domain = "NI 6509", "HWIL"
         self.title, self.connector, self.prefix = "PCIe-6509", "100-pin SCSI", "P"
         self.blocks = (
             Block("pins 1–50  ·  outputs", tuple(range(1, 50, 2)), tuple(range(2, 51, 2))),
@@ -238,32 +237,9 @@ class Ni6509(BoardType):
                                         Line(port * 8 + line, f"P{port}.{line}"))
         self._finish()
 
-    example = "P3.4"
-    expected = "P<0-11>.<0-7>"
-    line_pattern = r"^[Pp]?([0-9]|1[01])\.[0-7]$"
-
-    def parse(self, text: str) -> Line:
-        """Accepts ``P3.4``, ``p3.4`` or ``3.4``."""
-        m = _LINE_RE.match(str(text))
-        if m and int(m.group(1)) < self.PORTS and int(m.group(2)) < self.LINES_PER_PORT:
-            return self._by_text[f"P{int(m.group(1))}.{int(m.group(2))}"]
-        m = _LOOSE_LINE.match(str(text))
-        if m:
-            port, ln = int(m.group(1)), int(m.group(3))
-            if port >= self.PORTS:
-                raise ValueError(f'"{text}": there is no port {port} (ports are P0-P11)')
-            if ln >= self.LINES_PER_PORT:
-                raise ValueError(f'"{text}": there is no line {ln} (lines are .0-.7)')
-            raise ValueError(f'"{text}" is not a 6509 line; did you mean "P{port}.{ln}"?')
-        raise ValueError(f'"{text}" is not a 6509 line (expected P<0-11>.<0-7>, e.g. "P3.4")')
-
     def fixed_direction(self, line: Line) -> Direction:
         port = line.index // self.LINES_PER_PORT
         return Direction.OUTPUT if port in self.OUTPUT_PORTS else Direction.INPUT
-
-    def why_direction(self, line: Line) -> str:
-        return ("pins 1-50 (P0-P5) are outputs" if self.fixed_direction(line) is Direction.OUTPUT
-                else "pins 51-100 (P6-P11) are inputs")
 
     def group(self, line: Line) -> None:
         return None
@@ -290,7 +266,7 @@ NI_9205 = BoardType(
     _run("AI", 0, 8) + ["DO0", "COM"] + _run("AI", 16, 8) + ["AISENSE"]
     # pins 20-37
     + _run("AI", 8, 8) + ["PFI0", "COM"] + _run("AI", 24, 8),
-    "AI", direction=Direction.INPUT, why="every NI 9205 channel is an analog input",
+    "AI", direction=Direction.INPUT,
     aux={"DO0": "the module's digital output; not mapped by this editor",
          "PFI0": "trigger / digital input; not mapped by this editor",
          "AISENSE": "reference for NRSE measurements"},
@@ -300,7 +276,7 @@ NI_9264 = BoardType(
     "NI 9264", "NI 9264 with DSUB", "37-pin DSUB", _dsub(37, "analog outputs"),
     _run("AO", 0, 8) + ["NC", "NC"] + _run("AO", 8, 8) + ["COM"]   # pins 1-19
     + ["COM"] * 18,                                                # pins 20-37
-    "AO", direction=Direction.OUTPUT, why="every NI 9264 channel is an analog output",
+    "AO", direction=Direction.OUTPUT,
 )
 
 NI_9401 = BoardType(
@@ -314,15 +290,122 @@ NI_9476 = BoardType(
     "NI 9476", "NI 9476 with DSUB", "37-pin DSUB", _dsub(37, "digital outputs (sourcing)"),
     _run("DO", 0, 8) + ["Vsup", "Vsup"] + _run("DO", 8, 8) + ["COM"]   # pins 1-19
     + _run("DO", 16, 8) + ["Vsup", "Vsup"] + _run("DO", 24, 8),        # pins 20-37
-    "DO", direction=Direction.OUTPUT, why="every NI 9476 channel is a digital output",
+    "DO", direction=Direction.OUTPUT,
 )
 
 NI_6509 = Ni6509()
 
-#: Every board the editor knows, in the order the menus show them.
-BOARD_TYPES: dict[str, BoardType] = {
-    t.key: t for t in (NI_6509, NI_9205, NI_9264, NI_9401, NI_9476)
+
+# ---------------------------------------------------------------- MicroGate serial card
+
+#: The ways a serial port can be set up, and which signals each one uses.
+#: PLACEHOLDERS: replace with the setups your stands really use.
+SERIAL_SETUPS: dict[str, tuple[str, ...]] = {
+    "Async 8N1, external clock": ("TxD", "RxD", "TxC", "RxC"),
+    "Async 8N1, 115200 bps": ("TxD", "RxD"),
+    "HDLC, 1 Mbps internal clock": ("TxD", "RxD", "AUXCLK", "RxC"),
+    "HDLC, external clock": ("TxD", "RxD", "TxC", "RxC"),
 }
+
+#: One port's 25-pin connector, pin 1 first: (signal, direction or None).
+#: PLACEHOLDER: this is the generic EIA-530 arrangement, NOT taken from the
+#: MicroGate hardware manual. Check it before wiring from the drawing.
+_OUT, _IN = Direction.OUTPUT, Direction.INPUT
+SERIAL_PINS: list[tuple[str, Direction | None]] = [
+    ("SHLD", None), ("TxD-", _OUT), ("RxD-", _IN), ("RTS-", _OUT), ("CTS-", _IN), ("DSR-", _IN), ("GND", None),
+    ("DCD-", _IN), ("RxC+", _IN), ("DCD+", _IN), ("AUXCLK+", _OUT), ("TxC+", _IN), ("CTS+", _IN),      # 1-13
+    ("TxD+", _OUT), ("TxC-", _IN), ("RxD+", _IN), ("RxC-", _IN), ("NC", None), ("RTS+", _OUT), ("DTR-", _OUT),
+    ("NC", None), ("DSR+", _IN), ("DTR+", _OUT), ("AUXCLK-", _OUT), ("NC", None),                       # 14-25
+]
+
+
+class MicroGate(BoardType):
+    """MicroGate SyncLink GT4e: four serial ports. A port in use has a name
+    and a setup; its "channels" are the ports themselves (PORT0-PORT3)."""
+
+    domain, kind = "HWIL", "MicroGate"
+    option_key, option_label, options = "setup", "Setup", tuple(SERIAL_SETUPS)
+    writes_direction, pin_word = False, "port"
+    PORTS = 4
+
+    def __init__(self) -> None:
+        super().__init__("MicroGate GT4e", "MicroGate SyncLink GT4e", "4 serial ports",
+                         (Block("ports", (1, 2), (3, 4)),), _run("PORT", 0, self.PORTS), "PORT",
+                         direction=Direction.OUTPUT)
+
+    def pin_text(self, pin: int) -> str:
+        return str(pin - 1)
+
+    def describe(self, line: Line) -> str:
+        return f"Port {line.index}"
+
+
+class SerialPortView(BoardType):
+    """The 25-pin connector of a serial port, for drawing only: it shows
+    which pins a port's setup uses. Not a board, and not in ``BOARD_TYPES``."""
+
+    names_beside_pins = False
+
+    def __init__(self) -> None:
+        self.key, self.blocks = "serial port", _dsub(25, "EIA-530 layout, not verified")
+        self._direction = Direction.OUTPUT  # no direction groups
+        self._directions: dict[Line, Direction] = {}
+        self.pins = {}
+        for pin, (label, direction) in enumerate(SERIAL_PINS, start=1):
+            if direction is None:
+                self.pins[pin] = Signal(SignalKind.NC if label == "NC" else SignalKind.GND, label)
+            else:
+                self.pins[pin] = Signal(SignalKind.LINE, label, Line(pin, label))
+                self._directions[self.pins[pin].line] = direction
+        self._finish()
+
+    def fixed_direction(self, line: Line) -> Direction:
+        return self._directions[line]
+
+    def used_by(self, setup: str) -> list[Line]:
+        """The pins a setup uses (both wires of each signal)."""
+        names = SERIAL_SETUPS.get(setup, ())
+        return [s.line for s in self.pins.values() if s.line and s.label.rstrip("+-") in names]
+
+
+SERIAL_VIEW = SerialPortView()
+
+
+# ---------------------------------------------------------------- Concurrent analog output card
+
+
+class AnalogOut(BoardType):
+    """Concurrent CCURAOCC (CP-DA3218): 32 analog output channels, each with
+    a name and an output range. Drawn as channels 0-31, NOT as connector
+    pins: the card's connector pinout is not in here yet."""
+
+    domain, kind = "HWIL", "Analog output"
+    option_key, option_label = "range", "Range"
+    #: Output ranges per Concurrent's CP-DA3218 data sheet.
+    options = ("-10 to 10 V", "-5 to 5 V", "-2.5 to 2.5 V", "0 to 10 V", "0 to 5 V")
+    pin_word = "channel"
+
+    def __init__(self) -> None:
+        super().__init__("CCURAOCC", "Concurrent CCURAOCC", "32 channels",
+                         (Block("32 channels  ·  outputs", tuple(range(1, 17)), tuple(range(17, 33))),),
+                         _run("CH", 0, 32), "CH", direction=Direction.OUTPUT)
+
+    def pin_text(self, pin: int) -> str:
+        return str(pin - 1)
+
+    def describe(self, line: Line) -> str:
+        return f"Channel {line.index}"
+
+
+MICROGATE = MicroGate()
+ANALOG_OUT = AnalogOut()
+
+#: Every board the editor knows, in the order the buttons show them.
+BOARD_TYPES: dict[str, BoardType] = {
+    t.key: t for t in (NI_6509, MICROGATE, ANALOG_OUT, NI_9205, NI_9264, NI_9401, NI_9476)
+}
+#: The two areas of the editor, in order.
+DOMAINS = ("HWIL", "Ground Software")
 #: What a board is when the file doesn't say (files from before "type" existed).
 DEFAULT_TYPE = NI_6509.key
 
@@ -334,7 +417,11 @@ def board_type(key: str) -> BoardType:
 def find_type(text: str) -> BoardType | None:
     """Match a board type loosely by its model number: ``NI 9205``,
     ``ni-9205``, ``NI9205`` and ``9205`` are all the NI 9205."""
+    squash = re.sub(r"[^a-z0-9]", "", str(text).lower())
+    for t in BOARD_TYPES.values():  # "microgate gt4e", "CCURAOCC", "ccuraocc"
+        if squash == re.sub(r"[^a-z0-9]", "", t.key.lower()):
+            return t
     digits = re.findall(r"\d{4}", str(text))
     if len(digits) != 1:
         return None
-    return next((t for t in BOARD_TYPES.values() if t.short == digits[0]), None)
+    return next((t for t in BOARD_TYPES.values() if t.key.endswith(digits[0])), None)

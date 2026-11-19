@@ -1,0 +1,43 @@
+{
+  "boards": [
+    {
+      "name": "DIO card 1",
+      "type": "NI 6509",
+      "signals": [
+        {
+          "name": "POWER_EN",
+          "line": "P0.0",
+          "direction": "output"
+        },
+        {
+          "name": "HEATER_ON",
+          "line": "P6.0",
+          "direction": "input"
+        }
+      ]
+    },
+    {
+      "name": "Serial card 1",
+      "type": "MicroGate GT4e",
+      "signals": [
+        {
+          "name": "IMU_LINK",
+          "line": "PORT0",
+          "setup": "Async 8N1, external clock"
+        }
+      ]
+    },
+    {
+      "name": "Analog card 1",
+      "type": "CCURAOCC",
+      "signals": [
+        {
+          "name": "FIN_1_POS",
+          "line": "CH0",
+          "direction": "output",
+          "range": "-10 to 10 V"
+        }
+      ]
+    }
+  ]
+}

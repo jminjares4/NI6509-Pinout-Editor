@@ -1,0 +1,48 @@
+{
+  "boards": [
+    {
+      "name": "AI module",
+      "type": "NI 9205",
+      "signals": [
+        {
+          "name": "TANK_PRESS",
+          "line": "AI0",
+          "direction": "input"
+        }
+      ]
+    },
+    {
+      "name": "AO module",
+      "type": "NI 9264",
+      "signals": [
+        {
+          "name": "VALVE_REF",
+          "line": "AO0",
+          "direction": "output"
+        }
+      ]
+    },
+    {
+      "name": "TTL module",
+      "type": "NI 9401",
+      "signals": [
+        {
+          "name": "TRIG_OUT",
+          "line": "DIO4",
+          "direction": "output"
+        }
+      ]
+    },
+    {
+      "name": "DO module",
+      "type": "NI 9476",
+      "signals": [
+        {
+          "name": "SOLENOID_1",
+          "line": "DO0",
+          "direction": "output"
+        }
+      ]
+    }
+  ]
+}

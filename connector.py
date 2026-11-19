@@ -6,20 +6,19 @@ as one block with pins 1..n down the left and the rest down the right. The
 layout comes from the board type's ``blocks`` (see ``pinout.py``). The widget
 only draws and reports clicks; it never changes the project itself.
 
-Hovering is kept cheap so it tracks the mouse smoothly: finding the pin under
-the cursor is arithmetic, moving between pins repaints only the two pin boxes
-involved, and the pin details show in a card drawn inside the widget instead
-of a native tooltip window.
+Hovering repaints only the pin boxes involved.
 """
 
 from __future__ import annotations
 
+import functools
+
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QFontDatabase, QMouseEvent, QPainter, QPen
-from PyQt6.QtWidgets import QLabel, QWidget
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QMouseEvent, QPainter, QPen
+from PyQt6.QtWidgets import QWidget
 
 from model import Board, Direction, Issue, Severity, worst_on
-from pinout import BOARD_TYPES, DEFAULT_TYPE, BoardType, SignalKind, board_type
+from pinout import DEFAULT_TYPE, BoardType, SignalKind, board_type
 import theme as t
 
 ROW_H = 19
@@ -27,11 +26,10 @@ PIN_W, PIN_H = 36, 16
 LABEL_W = 150  # channel name plus signal name, beside each pin
 SIG_W = 54     # of which the channel name ("P11.7", "AISENSE")
 SPINE = 6
-BLOCK_GAP = 40
+BLOCK_GAP = 16
 HEADER_H = 20
-BLOCK_W = LABEL_W + 6 + PIN_W + SPINE + PIN_W + 6 + LABEL_W
 MARGIN = 8
-SIDE = 36  # extra room left and right so the hover card fits beside the outer columns
+SIDE = 44  # extra room left and right, on boards that label their direction groups there
 
 
 class _Layout:
@@ -40,52 +38,47 @@ class _Layout:
     def __init__(self, bt: BoardType) -> None:
         self.rects: dict[int, QRectF] = {}
         self.left: dict[int, bool] = {}  # pin -> its labels are on its left
-        #: (x, y of the first row, pins top to bottom), for finding a pin by position
-        self.columns: list[tuple[float, float, tuple[int, ...]]] = []
         self.blocks: list[tuple[float, str, QRectF, tuple[int, ...]]] = []
         rows = 0
         top = MARGIN + HEADER_H
+        side = SIDE if any(bt.group(line) for line in bt.lines) else 0
+        #: Room beside each pin: its channel and its signal's name, or the channel alone.
+        self.label_w = label_w = LABEL_W if bt.names_beside_pins else SIG_W + 56
+        self.block_w = block_w = 2 * (label_w + 6 + PIN_W) + SPINE
         for n, block in enumerate(bt.blocks):
-            x0 = MARGIN + SIDE + n * (BLOCK_W + BLOCK_GAP)
-            left_x = x0 + LABEL_W + 6
+            x0 = MARGIN + side + n * (block_w + BLOCK_GAP)
+            left_x = x0 + label_w + 6
             longest = max(len(block.left), len(block.right))
             rows = max(rows, longest)
             for pins, x, is_left in ((block.left, left_x, True),
                                      (block.right, left_x + PIN_W + SPINE, False)):
                 # The shorter row of a DSUB sits half a step lower, like the real thing.
                 y0 = top + (ROW_H / 2 if block.stagger and len(pins) < longest else 0)
-                self.columns.append((x, y0, pins))
                 for row, pin in enumerate(pins):
                     self.rects[pin] = QRectF(x, y0 + row * ROW_H + (ROW_H - PIN_H) / 2, PIN_W, PIN_H)
                     self.left[pin] = is_left
             housing = QRectF(left_x - 5, top + (ROW_H - PIN_H) / 2 - 5,
                              2 * PIN_W + SPINE + 10, (longest - 1) * ROW_H + PIN_H + 10)
             self.blocks.append((x0, block.caption, housing, block.left + block.right))
-        self.size = QSize(len(bt.blocks) * BLOCK_W + (len(bt.blocks) - 1) * BLOCK_GAP
-                          + 2 * (MARGIN + SIDE), HEADER_H + rows * ROW_H + 2 * MARGIN)
+        self.size = QSize(len(bt.blocks) * block_w + (len(bt.blocks) - 1) * BLOCK_GAP
+                          + 2 * (MARGIN + side), HEADER_H + rows * ROW_H + 2 * MARGIN)
 
 
-_LAYOUTS: dict[str, _Layout] = {}
-
-
+@functools.cache
 def layout_of(bt: BoardType) -> _Layout:
-    if bt.key not in _LAYOUTS:
-        _LAYOUTS[bt.key] = _Layout(bt)
-    return _LAYOUTS[bt.key]
-
-
-def widest() -> int:
-    """Width of the widest connector, so the window can leave room for it."""
-    return max(layout_of(bt).size.width() for bt in BOARD_TYPES.values())
+    return _Layout(bt)
 
 
 class ConnectorWidget(QWidget):
     pinClicked = pyqtSignal(int)
-    pinDoubleClicked = pyqtSignal(int)
     deletePressed = pyqtSignal()
     escapePressed = pyqtSignal()
+    #: Up or Down: step to the previous (-1) or next (+1) channel.
+    stepPressed = pyqtSignal(int)
     #: Click on the selected pin again, or on empty space: clear the selection.
     cleared = pyqtSignal()
+    #: A click anywhere on a read-only drawing (see ``readonly``).
+    pressed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -96,6 +89,9 @@ class ConnectorWidget(QWidget):
         self.issues: list[Issue] = []
         self.focus_pin: int | None = None
         self.hover_pin: int | None = None
+        #: A drawing that only shows (a serial port's connector): no hover,
+        #: no pin selection, any click just reports ``pressed``.
+        self.readonly = False
         self.bt = board_type(DEFAULT_TYPE)
         self.lay = layout_of(self.bt)
         self.mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
@@ -103,16 +99,6 @@ class ConnectorWidget(QWidget):
         self.mono_bold = QFont(self.mono)
         self.mono_bold.setBold(True)
         self.setFixedSize(self.lay.size)
-        # Hover details: a plain child label, so showing and moving it is
-        # instant (no window to create, no fade-in like QToolTip on macOS).
-        self.card = QLabel(self)
-        self.card.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.card.setTextFormat(Qt.TextFormat.PlainText)  # signal names and notes come from files
-        self.card.setStyleSheet(
-            f"QLabel {{ background: {t.RAISED}; color: {t.TEXT}; border: 1px solid {t.PIN_EDGE};"
-            " border-radius: 6px; padding: 6px 9px; }")
-        self.card.hide()
-
     def sizeHint(self) -> QSize:
         return self.lay.size
 
@@ -123,10 +109,7 @@ class ConnectorWidget(QWidget):
             self.bt = board.bt
             self.lay = layout_of(self.bt)
             self.hover_pin = None
-            self.card.hide()
             self.setFixedSize(self.lay.size)
-        if self.card.isVisible() and self.hover_pin:
-            self._show_card(self.hover_pin)
         self.update()
 
     # ------------------------------------------------------------ geometry
@@ -136,22 +119,15 @@ class ConnectorWidget(QWidget):
         return self.lay.rects[pin]
 
     def pin_at(self, pos: QPoint | QPointF) -> int | None:
-        """The pin under ``pos``, by arithmetic (this runs on every mouse move)."""
-        x, y = pos.x(), pos.y()
-        for left, y0, pins in self.lay.columns:
-            if left <= x < left + PIN_W:
-                row = int((y - y0) // ROW_H)
-                if 0 <= row < len(pins) and self.pin_rect(pins[row]).contains(QPointF(x, y)):
-                    return pins[row]
-                return None
-        return None
+        """The pin under ``pos``."""
+        return next((pin for pin, r in self.lay.rects.items() if r.contains(QPointF(pos))), None)
 
     def _row_rect(self, pin: int) -> QRectF:
         """Everything drawn for one pin: its box plus the labels beside it."""
         r = self.pin_rect(pin)
         if self.lay.left[pin]:
-            return QRectF(r.left() - 6 - LABEL_W, r.top() - 3, LABEL_W + 6 + r.width() + 2, r.height() + 6)
-        return QRectF(r.left() - 2, r.top() - 3, r.width() + 8 + LABEL_W, r.height() + 6)
+            return QRectF(r.left() - 6 - self.lay.label_w, r.top() - 3, self.lay.label_w + 6 + r.width() + 2, r.height() + 6)
+        return QRectF(r.left() - 2, r.top() - 3, r.width() + 8 + self.lay.label_w, r.height() + 6)
 
     # ------------------------------------------------------------ painting
 
@@ -162,16 +138,39 @@ class ConnectorWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for x0, caption, housing, pins in self.lay.blocks:
-            p.setPen(t.qc(t.DIM))
+            p.setPen(QColor(t.DIM))
             p.setFont(self.font())
-            p.drawText(QRectF(x0, MARGIN, BLOCK_W, 16), Qt.AlignmentFlag.AlignCenter, caption)
-            p.setPen(QPen(t.qc(t.HOUSING_EDGE), 1))
-            p.setBrush(t.qc(t.HOUSING))
+            p.drawText(QRectF(x0, MARGIN, self.lay.block_w, 16), Qt.AlignmentFlag.AlignCenter, caption)
+            p.setPen(QPen(QColor(t.HOUSING_EDGE), 1))
+            p.setBrush(QColor(t.HOUSING))
             p.drawRoundedRect(housing, 8, 8)
+            self._paint_groups(p, pins)
             for pin in pins:
                 if self._row_rect(pin).intersects(dirty):
                     self._paint_pin(p, pin)
         p.end()
+
+    def _paint_groups(self, p: QPainter, pins: tuple[int, ...]) -> None:
+        """Channels that share one direction (NI 9401: DIO0-3, DIO4-7) get a
+        tinted band in that direction's color, labelled IN or OUT."""
+        groups: dict[str, list[int]] = {}
+        for pin in pins:
+            line = self.bt.pins[pin].line
+            if line and self.bt.group(line):
+                groups.setdefault(self.bt.group(line), []).append(pin)
+        for members in groups.values():
+            output = self.board.direction(self.bt.pins[members[0]].line) is Direction.OUTPUT
+            first, last = self.pin_rect(members[0]), self.pin_rect(members[-1])
+            band = QRectF(first.left() - 3, first.top() - 0.5, PIN_W + 12 + LABEL_W, last.bottom() - first.top() + 1)
+            color = QColor(t.OUTPUT if output else t.INPUT)
+            p.setPen(QPen(color, 1))
+            color.setAlpha(34)
+            p.setBrush(color)
+            p.drawRoundedRect(band, 6, 6)
+            p.setPen(QColor(t.OUTPUT_TEXT if output else t.INPUT_TEXT))
+            p.setFont(self.mono_bold)
+            p.drawText(QRectF(band.right() + 6, band.top(), SIDE, band.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "OUT" if output else "IN")
 
     def _paint_pin(self, p: QPainter, pin: int) -> None:
         board = self.board
@@ -183,7 +182,7 @@ class ConnectorWidget(QWidget):
         output = bool(a) and board.direction(line) is Direction.OUTPUT
 
         if a:
-            fill, text = (t.OUTPUT if output else t.INPUT), t.TEXT
+            fill, text = (t.OUTPUT if output else t.INPUT), t.ON_PIN
         elif s.kind is SignalKind.POWER:
             fill, text = t.VCC, t.VCC_TEXT
         elif s.kind is SignalKind.GND:
@@ -196,21 +195,25 @@ class ConnectorWidget(QWidget):
             fill, text = t.FREE, t.DIM
 
         if pin == self.focus_pin:
-            pen = QPen(t.qc("#ffffff"), 2)
+            pen = QPen(QColor("#ffffff"), 2)
         elif sev is Severity.ERROR:
-            pen = QPen(t.qc(t.ERROR), 2)
+            pen = QPen(QColor(t.ERROR), 2)
         elif sev is Severity.WARNING:
-            pen = QPen(t.qc(t.WARN), 1.5)
+            pen = QPen(QColor(t.WARN), 1.5)
         elif pin == self.hover_pin:
-            pen = QPen(t.qc(t.ACCENT), 1.5)
+            pen = QPen(QColor(t.ACCENT), 1.5)
         else:
-            pen = QPen(t.qc(t.PIN_EDGE), 1)
+            pen = QPen(QColor(t.PIN_EDGE), 1)
         p.setPen(pen)
-        p.setBrush(t.qc(fill))
+        p.setBrush(QColor(fill))
         p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
-        p.setPen(t.qc(text))
+        p.setPen(QColor(text))
         p.setFont(self.mono)
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(pin))
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.bt.pin_text(pin))
+        if pin == self.focus_pin:  # the selected pin: a second ring in the accent color
+            p.setPen(QPen(QColor(t.ACCENT), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(-2.5, -2.5, 2.5, 2.5), 6, 6)
 
         # Channel name (P2.3, AI5) beside the box, signal name beyond it.
         left = self.lay.left[pin]
@@ -218,16 +221,16 @@ class ConnectorWidget(QWidget):
         sig_rect = (QRectF(rect.left() - 6 - SIG_W, cy - 9, SIG_W, 18) if left
                     else QRectF(rect.right() + 6, cy - 9, SIG_W, 18))
         align = (Qt.AlignmentFlag.AlignRight if left else Qt.AlignmentFlag.AlignLeft) | Qt.AlignmentFlag.AlignVCenter
-        p.setPen(t.qc(t.TEXT if a else t.NC_TEXT if s.kind is SignalKind.NC else t.DIM))
+        p.setPen(QColor(t.TEXT if a else t.NC_TEXT if s.kind is SignalKind.NC else t.DIM))
         p.setFont(self.mono_bold if a else self.mono)
         p.drawText(sig_rect, align, str(s))
-        if a:
+        if a and not self.readonly:  # a read-only drawing shows which pins, by color, not names
             name_w = LABEL_W - SIG_W - 4
             name_rect = (QRectF(rect.left() - 6 - LABEL_W, cy - 9, name_w, 18) if left
                          else QRectF(rect.right() + 6 + SIG_W + 4, cy - 9, name_w, 18))
             color = (t.ERROR if sev is Severity.ERROR else t.WARN if sev is Severity.WARNING
                      else t.OUTPUT_TEXT if output else t.INPUT_TEXT)
-            p.setPen(t.qc(color))
+            p.setPen(QColor(color))
             p.setFont(self.mono)
             name = a.name.strip() or "(no name)"
             elided = p.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, int(name_rect.width()))
@@ -235,44 +238,8 @@ class ConnectorWidget(QWidget):
 
     # ------------------------------------------------------------ input
 
-    def tooltip_for(self, pin: int) -> str:
-        """Hover details, one short fact per line so the card stays narrow."""
-        s = self.bt.pins[pin]
-        if s.kind is not SignalKind.LINE:
-            return f"pin {pin} · {s}\n{s.about}"
-        a = self.board.lines.get(s.line)
-        if a is None:
-            return f"pin {pin} · {s}\nfree\ndouble-click to add"
-        text = f"pin {pin} · {s}\n{a.name.strip() or '(no name)'}\n{self.board.direction(s.line).value}"
-        if a.note.strip():
-            text += f"\n{a.note.strip()}"
-        return text
-
     def _box_area(self, pin: int) -> QRect:
-        return self.pin_rect(pin).adjusted(-2, -2, 2, 2).toAlignedRect()
-
-    def _show_card(self, pin: int) -> None:
-        """Details beside the hovered pin, over its labels on the outer side,
-        so the card never covers a pin box you might move to next."""
-        card = self.card
-        card.setText(self.tooltip_for(pin))
-        card.setWordWrap(False)
-        card.setMinimumSize(0, 0)
-        card.setMaximumSize(16777215, 16777215)
-        natural = card.sizeHint()
-        r = self.pin_rect(pin)
-        left = self.lay.left[pin]
-        room = int(r.left() - 8 - 2) if left else int(self.width() - (r.right() + 8) - 2)
-        w = min(natural.width(), max(room, 90))
-        if w < natural.width():
-            card.setWordWrap(True)
-        h = card.heightForWidth(w) if card.wordWrap() else natural.height()
-        card.setFixedSize(w, h)
-        x = r.left() - 8 - w if left else r.right() + 8
-        y = r.center().y() - h / 2
-        card.move(int(max(2, min(x, self.width() - w - 2))), int(max(2, min(y, self.height() - h - 2))))
-        card.show()
-        card.raise_()
+        return self.pin_rect(pin).adjusted(-5, -5, 5, 5).toAlignedRect()
 
     def _set_hover(self, pin: int | None) -> None:
         if pin == self.hover_pin:
@@ -282,19 +249,19 @@ class ConnectorWidget(QWidget):
             if changed:
                 self.update(self._box_area(changed))
         self.setCursor(Qt.CursorShape.PointingHandCursor if pin else Qt.CursorShape.ArrowCursor)
-        if pin and self.board:
-            self._show_card(pin)
-        else:
-            self.card.hide()
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
-        self._set_hover(self.pin_at(e.position()))
+        if not self.readonly:
+            self._set_hover(self.pin_at(e.position()))
 
     def leaveEvent(self, _e) -> None:
         self._set_hover(None)
 
     def mousePressEvent(self, e: QMouseEvent) -> None:
         if e.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.readonly:
+            self.pressed.emit()
             return
         self.setFocus()
         pin = self.pin_at(e.position())
@@ -303,15 +270,12 @@ class ConnectorWidget(QWidget):
         else:
             self.pinClicked.emit(pin)
 
-    def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
-        pin = self.pin_at(e.position())
-        if pin and e.button() == Qt.MouseButton.LeftButton:
-            self.pinDoubleClicked.emit(pin)
-
     def keyPressEvent(self, e) -> None:
         if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.deletePressed.emit()
         elif e.key() == Qt.Key.Key_Escape:
             self.escapePressed.emit()
+        elif e.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self.stepPressed.emit(1 if e.key() == Qt.Key.Key_Down else -1)
         else:
             super().keyPressEvent(e)
